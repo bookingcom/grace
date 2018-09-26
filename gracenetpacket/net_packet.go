@@ -1,12 +1,4 @@
-// Package gracenet provides a family of Listen functions that either open a
-// fresh connection or provide an inherited connection from when the process
-// was started. The behave like their counterparts in the net package, but
-// transparently provide support for graceful restarts without dropping
-// connections. This is provided in a systemd socket activation compatible form
-// to allow using socket activation.
-//
-// BUG: Doesn't handle closing of listeners.
-package gracenet
+package gracenetpacket
 
 import (
 	"fmt"
@@ -20,24 +12,27 @@ import (
 
 const (
 	// Used to indicate a graceful restart in the new process.
-	envCountKey       = "LISTEN_FDS"
+	envCountKey       = "CONN_FDS"
 	envCountKeyPrefix = envCountKey + "="
 )
 
-// In order to keep the working directory the same as when we started we record
-// it at startup.
+// In order to keep the working directory the same as when we started we record it at startup.
 var originalWD, _ = os.Getwd()
 
-// Net provides the family of Listen functions and maintains the associated
+// Net provides the family of Packet Listen functions and maintains the associated
 // state. Typically you will have only once instance of Net per application.
 type Net struct {
-	inherited   []net.Listener
-	active      []net.Listener
+	inherited   []net.PacketConn
+	active      []net.PacketConn
 	mutex       sync.Mutex
 	inheritOnce sync.Once
 
 	// used in tests to override the default behavior of starting from fd 3.
 	fdStart int
+}
+
+func (n *Net) SetFdStart(fd int) {
+	n.fdStart = fd
 }
 
 func (n *Net) inherit() error {
@@ -55,17 +50,14 @@ func (n *Net) inherit() error {
 			return
 		}
 
-		// In tests this may be overridden.
 		fdStart := n.fdStart
 		if fdStart == 0 {
-			// In normal operations if we are inheriting, the listeners will begin at
-			// fd 3.
 			fdStart = 3
 		}
 
 		for i := fdStart; i < fdStart+count; i++ {
-			file := os.NewFile(uintptr(i), "listener")
-			l, err := net.FileListener(file)
+			file := os.NewFile(uintptr(i), "packet_listener")
+			l, err := net.FilePacketConn(file)
 			if err != nil {
 				file.Close()
 				retErr = fmt.Errorf("error inheriting socket fd %d: %s", i, err)
@@ -81,33 +73,26 @@ func (n *Net) inherit() error {
 	return retErr
 }
 
-// Listen announces on the local network address laddr. The network net must be
-// a stream-oriented network: "tcp", "tcp4", "tcp6", "unix" or "unixpacket". It
-// returns an inherited net.Listener for the matching network and address, or
-// creates a new one using net.Listen.
-func (n *Net) Listen(nett, laddr string) (net.Listener, error) {
+// ListenPacket announces on the local network address laddr. The network must
+// be "udp", "udp4" or "udp6". It returns an inherited net.PacketConn for the
+// matching network and address, or creates a new one using net.ListenPacket.
+func (n *Net) ListenPacket(nett, laddr string) (net.PacketConn, error) {
 	switch nett {
 	default:
 		return nil, net.UnknownNetworkError(nett)
-	case "tcp", "tcp4", "tcp6":
-		addr, err := net.ResolveTCPAddr(nett, laddr)
+	case "udp", "udp4", "udp6":
+		addr, err := net.ResolveUDPAddr(nett, laddr)
 		if err != nil {
 			return nil, err
 		}
-		return n.ListenTCP(nett, addr)
-	case "unix", "unixpacket", "invalid_unix_net_for_test":
-		addr, err := net.ResolveUnixAddr(nett, laddr)
-		if err != nil {
-			return nil, err
-		}
-		return n.ListenUnix(nett, addr)
+		return n.ListenUDP(nett, addr)
 	}
 }
 
-// ListenTCP announces on the local network address laddr. The network net must
-// be: "tcp", "tcp4" or "tcp6". It returns an inherited net.Listener for the
-// matching network and address, or creates a new one using net.ListenTCP.
-func (n *Net) ListenTCP(nett string, laddr *net.TCPAddr) (*net.TCPListener, error) {
+// ListenUDP announces on the local network address laddr. The network net must
+// be: "udp", "udp4" or "udp6". It returns an inherited net.PacketConn for the
+// matching network and address, or creates a new one using net.ListenUDP.
+func (n *Net) ListenUDP(nett string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 	if err := n.inherit(); err != nil {
 		return nil, err
 	}
@@ -120,47 +105,15 @@ func (n *Net) ListenTCP(nett string, laddr *net.TCPAddr) (*net.TCPListener, erro
 		if l == nil { // we nil used inherited listeners
 			continue
 		}
-		if isSameAddr(l.Addr(), laddr) {
+		if isSameAddr(l.LocalAddr(), laddr) {
 			n.inherited[i] = nil
 			n.active = append(n.active, l)
-			return l.(*net.TCPListener), nil
+			return l.(*net.UDPConn), nil
 		}
 	}
 
 	// make a fresh listener
-	l, err := net.ListenTCP(nett, laddr)
-	if err != nil {
-		return nil, err
-	}
-	n.active = append(n.active, l)
-	return l, nil
-}
-
-// ListenUnix announces on the local network address laddr. The network net
-// must be a: "unix" or "unixpacket". It returns an inherited net.Listener for
-// the matching network and address, or creates a new one using net.ListenUnix.
-func (n *Net) ListenUnix(nett string, laddr *net.UnixAddr) (*net.UnixListener, error) {
-	if err := n.inherit(); err != nil {
-		return nil, err
-	}
-
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	// look for an inherited listener
-	for i, l := range n.inherited {
-		if l == nil { // we nil used inherited listeners
-			continue
-		}
-		if isSameAddr(l.Addr(), laddr) {
-			n.inherited[i] = nil
-			n.active = append(n.active, l)
-			return l.(*net.UnixListener), nil
-		}
-	}
-
-	// make a fresh listener
-	l, err := net.ListenUnix(nett, laddr)
+	l, err := net.ListenUDP(nett, laddr)
 	if err != nil {
 		return nil, err
 	}
@@ -169,12 +122,16 @@ func (n *Net) ListenUnix(nett string, laddr *net.UnixAddr) (*net.UnixListener, e
 }
 
 // activeListeners returns a snapshot copy of the active listeners.
-func (n *Net) activeListeners() ([]net.Listener, error) {
+func (n *Net) activeListeners() ([]net.PacketConn, error) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	ls := make([]net.Listener, len(n.active))
+	ls := make([]net.PacketConn, len(n.active))
 	copy(ls, n.active)
 	return ls, nil
+}
+
+func (n *Net) GetActiveListeners() ([]net.PacketConn, error) {
+	return n.activeListeners()
 }
 
 func isSameAddr(a1, a2 net.Addr) bool {
@@ -218,9 +175,6 @@ func (n *Net) StartProcess() (int, error) {
 		}
 		defer files[i].Close()
 	}
-
-	// Use the original binary location. This works with symlinks such that if
-	// the file it points to has been changed we will use the updated symlink.
 	argv0, err := exec.LookPath(os.Args[0])
 	if err != nil {
 		return 0, err
@@ -245,10 +199,6 @@ func (n *Net) StartProcess() (int, error) {
 		return 0, err
 	}
 	return process.Pid, nil
-}
-
-func (n *Net) GetActiveListeners() ([]net.Listener, error) {
-	return n.activeListeners()
 }
 
 type filer interface {

@@ -17,11 +17,11 @@ Usage
 -----
 
 Demo HTTP Server with graceful termination and restart:
-https://github.com/facebookgo/grace/blob/master/gracedemo/demo.go
+https://github.com/bookingcom/blob/master/gracedemo/demo.go
 
 1. Install the demo application
 
-        go get github.com/facebookgo/grace/gracedemo
+        go get github.com/bookingcom/gracedemo
 
 1. Start it in the first terminal
 
@@ -55,7 +55,7 @@ Documentation
 -------------
 
 `http.Server` graceful termination and restart:
-https://godoc.org/github.com/facebookgo/grace/gracehttp
+https://godoc.org/github.com/bookingcom/gracehttp
 
 `net.Listener` graceful termination and restart:
-https://godoc.org/github.com/facebookgo/grace/gracenet
+https://godoc.org/github.com/bookingcom/gracenet

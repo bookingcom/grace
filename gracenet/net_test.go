@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/facebookgo/ensure"
-	"github.com/facebookgo/freeport"
+	"github.com/facebookarchive/ensure"
+	"github.com/facebookarchive/freeport"
 )
 
 func TestEmptyCountEnvVariable(t *testing.T) {

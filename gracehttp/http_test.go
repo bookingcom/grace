@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/facebookgo/freeport"
+	"github.com/facebookarchive/freeport"
 )
 
 const (
