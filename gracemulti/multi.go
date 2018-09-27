@@ -14,9 +14,10 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/facebookgo/httpdown"
 	"github.com/bookingcom/grace/gracenet"
 	"github.com/bookingcom/grace/gracenetpacket"
+	"github.com/facebookgo/httpdown"
+	"github.com/vishvananda/netns"
 	"os/exec"
 	"strings"
 	"time"
@@ -46,11 +47,12 @@ var (
 )
 
 type UdpServer struct {
-	Addr    string
-	Network string
-	Threads int
-	Data    interface{}
-	Handler func(*net.UDPConn, interface{})
+	Addr      string
+	Network   string
+	Namespace *netns.NsHandle
+	Threads   int
+	Data      interface{}
+	Handler   func(*net.UDPConn, interface{})
 }
 
 type MultiServer struct {
@@ -66,7 +68,9 @@ type app struct {
 	packetnet       *gracenetpacket.Net
 	listeners       []net.Listener
 	connections     []*net.UDPConn
+	connectionsLock *sync.Mutex
 	sds             []httpdown.Server
+	wg              sync.WaitGroup
 	errors          chan error
 	preStartProcess func() error
 	preKillProcess  func() error
@@ -83,6 +87,7 @@ func newApp(servers MultiServer) *app {
 		packetnet:       &gracenetpacket.Net{},
 		listeners:       make([]net.Listener, 0, len_http),
 		connections:     make([]*net.UDPConn, 0, len_udp),
+		connectionsLock: &sync.Mutex{},
 		sds:             make([]httpdown.Server, 0, len_http),
 		errors:          make(chan error, 1+(len_http+len_udp)*2),
 		preStartProcess: func() error { return nil },
@@ -98,9 +103,11 @@ func (a *app) listen() error {
 		}
 		a.listeners = append(a.listeners, l)
 	}
+	a.connectionsLock.Lock()
+	defer a.connectionsLock.Unlock()
 	a.packetnet.SetFdStart(len(a.listeners) + 3)
 	for _, s := range a.servers.UDP {
-		l, err := a.packetnet.ListenPacket(s.Network, s.Addr)
+		l, err := a.packetnet.ListenPacketNamespace(s.Network, s.Addr, s.Namespace)
 		if err != nil {
 			return err
 		}
@@ -140,12 +147,11 @@ func (a *app) serveUdp(wg *sync.WaitGroup) {
 }
 
 func (a *app) wait() {
-	var wg sync.WaitGroup
-	go a.signalHandler(&wg)
-	wg.Add(2*len(a.listeners) + len(a.connections)) // Wait (http & udp) & Stop (http)
-	a.serveHttp(&wg)
-	a.serveUdp(&wg)
-	wg.Wait()
+	go a.signalHandler(&a.wg)
+	a.wg.Add(2*len(a.listeners) + len(a.connections)) // Wait (http & udp) & Stop (http)
+	a.serveHttp(&a.wg)
+	a.serveUdp(&a.wg)
+	a.wg.Wait()
 }
 
 func (a *app) term(wg *sync.WaitGroup) {
@@ -260,6 +266,24 @@ func (a *app) StartProcess() (int, error) {
 		return 0, err
 	}
 	return process.Pid, nil
+}
+
+func (a *app) AppendUdpServer(s *UdpServer) error {
+	l, err := a.packetnet.ListenPacketNamespace(s.Network, s.Addr, s.Namespace)
+	if err != nil {
+		return err
+	}
+	a.connectionsLock.Lock()
+	defer a.connectionsLock.Unlock()
+	a.connections = append(a.connections, l.(*net.UDPConn))
+	for t := 0; t < s.Threads; t++ {
+		go func(server *UdpServer, listener *net.UDPConn) {
+			defer a.wg.Done()
+			a.wg.Add(1) // Wait for the thread
+			server.Handler(listener, server.Data)
+		}(s, l.(*net.UDPConn))
+	}
+	return nil
 }
 
 func Serve(servers MultiServer, options ...option) error {

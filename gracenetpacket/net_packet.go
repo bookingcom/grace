@@ -2,12 +2,17 @@ package gracenetpacket
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+
+	"github.com/vishvananda/netns"
 )
 
 const (
@@ -77,6 +82,10 @@ func (n *Net) inherit() error {
 // be "udp", "udp4" or "udp6". It returns an inherited net.PacketConn for the
 // matching network and address, or creates a new one using net.ListenPacket.
 func (n *Net) ListenPacket(nett, laddr string) (net.PacketConn, error) {
+	return n.ListenPacketNamespace(nett, laddr, nil)
+}
+
+func (n *Net) ListenPacketNamespace(nett, laddr string, ns *netns.NsHandle) (net.PacketConn, error) {
 	switch nett {
 	default:
 		return nil, net.UnknownNetworkError(nett)
@@ -85,7 +94,11 @@ func (n *Net) ListenPacket(nett, laddr string) (net.PacketConn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return n.ListenUDP(nett, addr)
+		if ns == nil {
+			return n.ListenUDP(nett, addr)
+		} else {
+			return n.ListenUDPNamespace(nett, addr, *ns)
+		}
 	}
 }
 
@@ -93,6 +106,14 @@ func (n *Net) ListenPacket(nett, laddr string) (net.PacketConn, error) {
 // be: "udp", "udp4" or "udp6". It returns an inherited net.PacketConn for the
 // matching network and address, or creates a new one using net.ListenUDP.
 func (n *Net) ListenUDP(nett string, laddr *net.UDPAddr) (*net.UDPConn, error) {
+	// Save the current network namespace
+	origns, _ := netns.Get()
+	defer origns.Close()
+
+	return n.ListenUDPNamespace(nett, laddr, origns)
+}
+
+func (n *Net) ListenUDPNamespace(nett string, laddr *net.UDPAddr, ns netns.NsHandle) (*net.UDPConn, error) {
 	if err := n.inherit(); err != nil {
 		return nil, err
 	}
@@ -106,14 +127,18 @@ func (n *Net) ListenUDP(nett string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 			continue
 		}
 		if isSameAddr(l.LocalAddr(), laddr) {
-			n.inherited[i] = nil
-			n.active = append(n.active, l)
-			return l.(*net.UDPConn), nil
+			if match, err := isInNamespace(l, ns); err != nil {
+				return nil, err
+			} else if match {
+				n.inherited[i] = nil
+				n.active = append(n.active, l)
+				return l.(*net.UDPConn), nil
+			}
 		}
 	}
 
 	// make a fresh listener
-	l, err := net.ListenUDP(nett, laddr)
+	l, err := listenUDPInNamespace(nett, laddr, ns)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +178,70 @@ func isSameAddr(a1, a2 net.Addr) bool {
 	a1s = strings.TrimPrefix(a1s, ipv4prefix)
 	a2s = strings.TrimPrefix(a2s, ipv4prefix)
 	return a1s == a2s
+}
+
+func isInNamespace(l net.PacketConn, ns netns.NsHandle) (bool, error) {
+	file, err := l.(*net.UDPConn).File()
+	if err != nil {
+		return false, err
+	}
+	var s syscall.Stat_t
+	syscall.Fstat(int(file.Fd()), &s)
+
+	// Pin the goroutine to the OS Thread so we don't accidentally switch namespaces
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Save the current network namespace
+	origns, _ := netns.Get()
+	defer origns.Close()
+
+	// Switch to the desired network namespace
+	netns.Set(ns)
+
+	// Get all the sockets in the network namespace
+	data, err := ioutil.ReadFile("/proc/net/udp")
+	if err != nil {
+		return false, err
+	}
+	data6, err := ioutil.ReadFile("/proc/net/udp6")
+	if err != nil {
+		return false, err
+	}
+	data = append(data, data6...)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		// Inode numbers match
+		if strconv.Itoa(int(s.Ino)) == parts[9] {
+			return true, nil
+		}
+	}
+
+	netns.Set(origns)
+	return false, nil
+}
+
+func listenUDPInNamespace(nett string, laddr *net.UDPAddr, ns netns.NsHandle) (*net.UDPConn, error) {
+	// Pin the goroutine to the OS Thread so we don't accidentally switch namespaces
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Save the current network namespace
+	origns, _ := netns.Get()
+	defer origns.Close()
+
+	// Switch to the desired network namespace
+	netns.Set(ns)
+
+	// make a fresh listener
+	l, err := net.ListenUDP(nett, laddr)
+	if err != nil {
+		return nil, err
+	}
+
+	netns.Set(origns)
+	return l, nil
 }
 
 // StartProcess starts a new process passing it the active listeners. It
