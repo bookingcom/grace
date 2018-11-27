@@ -14,9 +14,9 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/facebookgo/httpdown"
 	"github.com/bookingcom/grace/gracenet"
 	"github.com/bookingcom/grace/gracenetpacket"
+	"github.com/facebookgo/httpdown"
 	"os/exec"
 	"strings"
 	"time"
@@ -33,6 +33,7 @@ const (
 
 // In order to keep the working directory the same as when we started we record it at startup.
 var originalWD, _ = os.Getwd()
+var childPID int
 
 type option func(*app)
 
@@ -184,13 +185,18 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 			a.term(wg)
 			return
 		case syscall.SIGUSR2:
-			if err := a.preStartProcess(); err != nil {
-				a.errors <- err
-			}
-			// we only return here if there's an error, otherwise the new process
-			// will send us a TERM when it's ready to trigger the actual shutdown.
-			if _, err := a.StartProcess(); err != nil {
-				a.errors <- err
+			if !childExists() {
+				if err := a.preStartProcess(); err != nil {
+					a.errors <- err
+				}
+				// we only return here if there's an error, otherwise the new process
+				// will send us a TERM when it's ready to trigger the actual shutdown.
+				pid, err := a.StartProcess()
+				if err != nil {
+					a.errors <- err
+				} else {
+					childPID = pid
+				}
 			}
 		}
 	}
@@ -361,4 +367,16 @@ func SetLogger(l *log.Logger) {
 
 type filer interface {
 	File() (*os.File, error)
+}
+
+func childExists() bool {
+	if childPID == 0 {
+		return false
+	}
+	childProcess, err := os.FindProcess(childPID)
+	if err != nil {
+		return false
+	}
+	err = childProcess.Signal(syscall.Signal(0))
+	return err == nil
 }
