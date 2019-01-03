@@ -93,7 +93,13 @@ func newApp(servers MultiServer) *app {
 
 func (a *app) listen() error {
 	for _, s := range a.servers.HTTP {
-		l, err := a.net.Listen("tcp", s.Addr)
+		var l net.Listener
+		var err error
+		if s.Addr[:5] == "unix:" {
+			l, err = a.net.Listen("unix", s.Addr[5:])
+		} else {
+			l, err = a.net.Listen("tcp", s.Addr)
+		}
 		if err != nil {
 			return err
 		}
