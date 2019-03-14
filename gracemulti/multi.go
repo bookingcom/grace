@@ -33,6 +33,7 @@ const (
 
 // In order to keep the working directory the same as when we started we record it at startup.
 var originalWD, _ = os.Getwd()
+var childPID int
 
 type option func(*app)
 
@@ -67,11 +68,9 @@ type app struct {
 	listeners       []net.Listener
 	connections     []*net.UDPConn
 	sds             []httpdown.Server
-	childPID        int
 	errors          chan error
 	preStartProcess func() error
 	preKillProcess  func() error
-	postKilledChild func() error
 }
 
 func newApp(servers MultiServer) *app {
@@ -86,17 +85,21 @@ func newApp(servers MultiServer) *app {
 		listeners:       make([]net.Listener, 0, len_http),
 		connections:     make([]*net.UDPConn, 0, len_udp),
 		sds:             make([]httpdown.Server, 0, len_http),
-		childPID:        0,
 		errors:          make(chan error, 1+(len_http+len_udp)*2),
 		preStartProcess: func() error { return nil },
 		preKillProcess:  func() error { return nil },
-		postKilledChild: func() error { return nil },
 	}
 }
 
 func (a *app) listen() error {
 	for _, s := range a.servers.HTTP {
-		l, err := a.net.Listen("tcp", s.Addr)
+		var l net.Listener
+		var err error
+		if s.Addr[:5] == "unix:" {
+			l, err = a.net.Listen("unix", s.Addr[5:])
+		} else {
+			l, err = a.net.Listen("tcp", s.Addr)
+		}
 		if err != nil {
 			return err
 		}
@@ -173,14 +176,10 @@ func (a *app) term(wg *sync.WaitGroup) {
 
 func (a *app) signalHandler(wg *sync.WaitGroup) {
 	ch := make(chan os.Signal, 10)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2, syscall.SIGCHLD)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2)
 	for {
 		sig := <-ch
 		switch sig {
-		case syscall.SIGCHLD:
-			// the forked process was killed before it could send INT/TERM signal.
-			// handle cleanup procedure
-			a.handleKilledChild()
 		case syscall.SIGINT, syscall.SIGTERM:
 			// this ensures a subsequent INT/TERM will trigger standard go behaviour of terminating.
 			signal.Stop(ch)
@@ -192,14 +191,17 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 			a.term(wg)
 			return
 		case syscall.SIGUSR2:
-			if !a.childExists() {
+			if !childExists() {
 				if err := a.preStartProcess(); err != nil {
 					a.errors <- err
 				}
 				// we only return here if there's an error, otherwise the new process
 				// will send us a TERM when it's ready to trigger the actual shutdown.
-				if _, err := a.StartProcess(); err != nil {
+				pid, err := a.StartProcess()
+				if err != nil {
 					a.errors <- err
+				} else {
+					childPID = pid
 				}
 			}
 		}
@@ -269,7 +271,6 @@ func (a *app) StartProcess() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	a.childPID = process.Pid
 	return process.Pid, nil
 }
 
@@ -347,15 +348,6 @@ func PreKillProcess(hook func() error) option {
 	}
 }
 
-// PostKilledProcess configures a callback to trigger when forked child dies
-// abruptly after graceful restart. This allows the parent process to handle
-// cleanup, logging & resources that the child process might have used.
-func PostKillledChild(hook func() error) option {
-	return func(a *app) {
-		a.postKilledChild = hook
-	}
-}
-
 func (a *app) pprintAddr() []byte {
 	var out bytes.Buffer
 	fmt.Fprint(&out, "[HTTP]")
@@ -375,35 +367,22 @@ func (a *app) pprintAddr() []byte {
 	return out.Bytes()
 }
 
-func (a *app) childExists() bool {
-	if a.childPID == 0 {
-		return false
-	}
-	childProcess, err := os.FindProcess(a.childPID)
-	if err != nil {
-		return false
-	}
-	err = childProcess.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-func (a *app) handleKilledChild() {
-	if a.childPID == 0 {
-		return
-	}
-	childProcess, err := os.FindProcess(a.childPID)
-	if err != nil {
-		return
-	}
-	childProcess.Wait()
-	a.childPID = 0
-	a.postKilledChild()
+func SetLogger(l *log.Logger) {
+	logger = l
 }
 
 type filer interface {
 	File() (*os.File, error)
 }
 
-func SetLogger(l *log.Logger) {
-	logger = l
+func childExists() bool {
+	if childPID == 0 {
+		return false
+	}
+	childProcess, err := os.FindProcess(childPID)
+	if err != nil {
+		return false
+	}
+	err = childProcess.Signal(syscall.Signal(0))
+	return err == nil
 }
