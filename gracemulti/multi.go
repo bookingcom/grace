@@ -293,14 +293,14 @@ func Serve(servers MultiServer, options ...option) error {
 	if logger != nil {
 		if didInherit {
 			if ppid == 1 {
-				logger.Printf("Listening on init activated %s", a.pprintAddr)
+				logger.Printf("Listening on init activated %s", a.pprintAddr())
 			} else {
 				const msg = "Graceful handoff of %s with new pid %d and old pid %d"
-				logger.Printf(msg, a.pprintAddr, os.Getpid(), ppid)
+				logger.Printf(msg, a.pprintAddr(), os.Getpid(), ppid)
 			}
 		} else {
 			const msg = "Serving %s with pid %d"
-			logger.Printf(msg, a.pprintAddr, os.Getpid())
+			logger.Printf(msg, a.pprintAddr(), os.Getpid())
 		}
 	}
 
