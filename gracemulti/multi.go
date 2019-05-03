@@ -179,14 +179,11 @@ func (a *app) term(wg *sync.WaitGroup) {
 
 func (a *app) signalHandler(wg *sync.WaitGroup) {
 	ch := make(chan os.Signal, 10)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2, syscall.SIGCHLD)
+	signal.Ignore(syscall.SIGCHLD)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2)
 	for {
 		sig := <-ch
 		switch sig {
-		case syscall.SIGCHLD:
-			// the forked process was killed before it could send INT/TERM signal.
-			// handle cleanup procedure
-			a.handleKilledChild()
 		case syscall.SIGINT, syscall.SIGTERM:
 			// this ensures a subsequent INT/TERM will trigger standard go behaviour of terminating.
 			signal.Stop(ch)
