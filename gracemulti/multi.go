@@ -401,7 +401,7 @@ func (a *app) handleKilledChild() {
 	for {
 		var waitStatus syscall.WaitStatus
 		terminatedPID, err := syscall.Wait4(-1, &waitStatus, syscall.WNOHANG, nil)
-		if err != nil {
+		if (err != nil) || (terminatedPID <= 0) {
 			// No more zombies awaiting processing.
 			return
 		}
