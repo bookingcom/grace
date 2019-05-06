@@ -179,11 +179,14 @@ func (a *app) term(wg *sync.WaitGroup) {
 
 func (a *app) signalHandler(wg *sync.WaitGroup) {
 	ch := make(chan os.Signal, 10)
-	signal.Ignore(syscall.SIGCHLD)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2, syscall.SIGCHLD)
 	for {
 		sig := <-ch
 		switch sig {
+		case syscall.SIGCHLD:
+			// the forked process was killed before it could send INT/TERM signal.
+			// handle cleanup procedure
+			a.handleKilledChild()
 		case syscall.SIGINT, syscall.SIGTERM:
 			// this ensures a subsequent INT/TERM will trigger standard go behaviour of terminating.
 			signal.Stop(ch)
@@ -391,16 +394,22 @@ func (a *app) childExists() bool {
 }
 
 func (a *app) handleKilledChild() {
-	if a.childPID == 0 {
-		return
+	// We can receive SIGCHLDs from any os.exec calls as well as during the graceful restart
+	// of the main process, so we need to be careful to process all of them without blocking.
+	// There is also no guarantee that every child exiting will produce a unique SIGCHLD, hence
+	// the loop.
+	for {
+		var waitStatus syscall.WaitStatus
+		terminatedPID, err := syscall.Wait4(-1, &waitStatus, syscall.WNOHANG, nil)
+		if err != nil {
+			// No more zombies awaiting processing.
+			return
+		}
+		if (a.childPID != 0) && (a.childPID == terminatedPID) {
+			a.childPID = 0
+			a.postKilledChild()
+		}
 	}
-	childProcess, err := os.FindProcess(a.childPID)
-	if err != nil {
-		return
-	}
-	childProcess.Wait()
-	a.childPID = 0
-	a.postKilledChild()
 }
 
 type filer interface {
