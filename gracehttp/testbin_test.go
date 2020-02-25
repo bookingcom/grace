@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bookingcom/gracehttp"
+	"github.com/bookingcom/grace/gracehttp"
 )
 
 const preStartProcessEnv = "GRACEHTTP_PRE_START_PROCESS"

@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/bookingcom/gracehttp"
+	"github.com/bookingcom/grace/gracehttp"
 )
 
 var (
