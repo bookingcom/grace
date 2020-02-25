@@ -198,7 +198,8 @@ func TestInvalidTcpAddr(t *testing.T) {
 	var n Net
 	os.Setenv(envCountKey, "")
 	_, err := n.Listen("tcp", "abc")
-	ensure.Err(t, err, regexp.MustCompile("^missing port in address abc$"))
+	ensure.Err(t, err, regexp.MustCompile(`\bmissing port\b`))
+	ensure.Err(t, err, regexp.MustCompile(`\baddress abc\b`))
 }
 
 func TestTwoTCP(t *testing.T) {
