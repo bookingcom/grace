@@ -1,5 +1,5 @@
 // Package gracemulti provides easy to use graceful restart
-// functionality for HTTP & UDP servers.
+// functionality for HTTP, H2C & UDP servers.
 package gracemulti
 
 import (
@@ -10,16 +10,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/bookingcom/grace/graceh2c"
 	"github.com/bookingcom/grace/gracenet"
 	"github.com/bookingcom/grace/gracenetpacket"
 	"github.com/facebookgo/httpdown"
-	"os/exec"
-	"strings"
-	"time"
 )
 
 const (
@@ -27,14 +28,12 @@ const (
 	envCountListners    = "LISTEN_FDS"
 	envCountConnections = "CONN_FDS"
 
-	// default timeout is 5 seconds
-	defaultTimeout = 5 * time.Second
+	// default timeout is 60 seconds
+	defaultTimeout = 60 * time.Second
 )
 
 // In order to keep the working directory the same as when we started we record it at startup.
 var originalWD, _ = os.Getwd()
-
-type option func(*app)
 
 // timeout error
 var ErrTimeout = errors.New("shutdown wait timed out")
@@ -56,59 +55,202 @@ type UdpServer struct {
 type MultiServer struct {
 	HTTP []*http.Server
 	UDP  []*UdpServer
+	H2C  []*graceh2c.H2CServer
 }
 
 // An app contains one or more servers and associated configuration.
 type app struct {
-	servers         MultiServer
-	http            *httpdown.HTTP
-	net             *gracenet.Net
-	packetnet       *gracenetpacket.Net
-	listeners       []net.Listener
-	connections     []*net.UDPConn
-	sds             []httpdown.Server
-	childPID        int
-	errors          chan error
+	// Set of servers provided as an input for an app to manage
+	// the lifecycle of
+	servers MultiServer
+
+	// H2C servers and their internal dependencies
+	h2cListeners []net.Listener
+
+	// HTTP servers and their internal dependencies
+	http      *httpdown.HTTP
+	net       *gracenet.Net
+	listeners []net.Listener
+	sds       []httpdown.Server
+
+	// UDP servers and their internal dependencies
+	packetnet   *gracenetpacket.Net
+	connections []*net.UDPConn
+
+	// application-specific internals that help manage its lifecycle
+	childPID int
+	errors   chan error
+
+	// callbacks that can be configured externally by a client to
+	// perform a certain set of actions during the lifecycle of the
+	// application
 	preStartProcess func() error
 	preKillProcess  func() error
 	postKilledChild func() error
+
+	// allow non-graceful terminations
+	allowNonGracefulTerminations bool
 }
 
 func newApp(servers MultiServer) *app {
-	len_http := len(servers.HTTP)
-	len_udp := len(servers.UDP)
+	lenH2C := len(servers.H2C)
+	lenHttp := len(servers.HTTP)
+	lenUdp := len(servers.UDP)
 
 	return &app{
-		servers:         servers,
-		http:            &httpdown.HTTP{},
-		net:             &gracenet.Net{},
-		packetnet:       &gracenetpacket.Net{},
-		listeners:       make([]net.Listener, 0, len_http),
-		connections:     make([]*net.UDPConn, 0, len_udp),
-		sds:             make([]httpdown.Server, 0, len_http),
-		childPID:        0,
-		errors:          make(chan error, 1+(len_http+len_udp)*2),
+		servers: servers,
+
+		http:         &httpdown.HTTP{},
+		h2cListeners: make([]net.Listener, 0, lenH2C),
+		listeners:    make([]net.Listener, 0, lenHttp),
+		sds:          make([]httpdown.Server, 0, lenHttp),
+
+		net:         &gracenet.Net{},
+		packetnet:   &gracenetpacket.Net{},
+		connections: make([]*net.UDPConn, 0, lenUdp),
+
+		childPID: 0,
+		errors:   make(chan error, 1+(lenH2C+lenHttp+lenUdp)*2),
+
 		preStartProcess: func() error { return nil },
 		preKillProcess:  func() error { return nil },
 		postKilledChild: func() error { return nil },
+
+		allowNonGracefulTerminations: false,
 	}
 }
 
-func (a *app) listen() error {
-	for _, s := range a.servers.HTTP {
-		var l net.Listener
-		var err error
-		if s.Addr[:5] == "unix:" {
-			l, err = a.net.Listen("unix", s.Addr[5:])
+type option func(*app)
+
+// Serve is the main driver function that a client can invoke to start
+// serving requests using all requested servers passed as a `MultiServer`
+// object
+func Serve(servers MultiServer, options ...option) error {
+	// configure the internal app object
+	a := newApp(servers)
+	for _, opt := range options {
+		opt(a)
+	}
+	// acquire listeners to be able to do the graceful dance later
+	if err := a.acquireListeners(); err != nil {
+		return err
+	}
+	// some useful logging
+	if logger != nil {
+		if didInherit {
+			if ppid == 1 {
+				logger.Printf("Listening on init activated %s", a.pprintAddr())
+			} else {
+				const msg = "Graceful handoff of %s with new pid %d and old pid %d"
+				logger.Printf(msg, a.pprintAddr(), os.Getpid(), ppid)
+			}
 		} else {
-			l, err = a.net.Listen("tcp", s.Addr)
+			const msg = "Serving %s with pid %d"
+			logger.Printf(msg, a.pprintAddr(), os.Getpid())
 		}
+	}
+	// callback before killing parent process
+	if err := a.preKillProcess(); err != nil {
+		a.errors <- err
+	}
+	// close the parent if we inherited and it wasn't init that started us.
+	if didInherit && ppid != 1 {
+		if err := syscall.Kill(ppid, syscall.SIGTERM); err != nil {
+			return fmt.Errorf("failed to close parent: %s", err)
+		}
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		a.wait()
+	}()
+
+	select {
+	case err := <-a.errors:
+		if err == nil {
+			panic("unexpected nil error")
+		}
+		return err
+	case <-waitDone:
+		if logger != nil {
+			logger.Printf("Exiting pid %d.", os.Getpid())
+		}
+		return nil
+	}
+}
+
+// Allow non-graceful terminations when a SIGTERM is signalled to the process
+// This is useful when we want all servers being managed to sever their connections
+// immediately. Only supported by H2C servers for now because they can wait upto
+// `defaultTimeout = 60s` before beginning to terminate their connections.
+func AllowNonGracefulTerminations(allowNonGracefulTerminations bool) option {
+	return func(a *app) {
+		a.allowNonGracefulTerminations = allowNonGracefulTerminations
+	}
+}
+
+// PreStartProcess configures a callback to trigger during graceful restart
+// directly before starting the successor process. This allows the current
+// process to release holds on resources that the new process will need.
+func PreStartProcess(hook func() error) option {
+	return func(a *app) {
+		a.preStartProcess = hook
+	}
+}
+
+// PreKillProcess configures a callback to trigger after graceful restart
+// directly before killing the parent process. This allows the current
+// process to acquire holds on resources that the new process will need.
+func PreKillProcess(hook func() error) option {
+	return func(a *app) {
+		a.preKillProcess = hook
+	}
+}
+
+// PostKilledProcess configures a callback to trigger when forked child dies
+// abruptly after graceful restart. This allows the parent process to handle
+// cleanup, logging & resources that the child process might have used.
+func PostKilledChild(hook func() error) option {
+	return func(a *app) {
+		a.postKilledChild = hook
+	}
+}
+
+// ------------------- internal methods -----------------------
+func (a *app) getHTTPListener(server *http.Server) (net.Listener, error) {
+	var (
+		l   net.Listener
+		err error
+	)
+	if server.Addr[:5] == "unix:" {
+		l, err = a.net.Listen("unix", server.Addr[5:])
+	} else {
+		l, err = a.net.Listen("tcp", server.Addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return l, err
+}
+
+func (a *app) acquireListeners() error {
+	for _, s := range a.servers.H2C {
+		srv := s.Server()
+		l, err := a.getHTTPListener(srv)
+		if err != nil {
+			return err
+		}
+		a.h2cListeners = append(a.h2cListeners, l)
+	}
+	for _, s := range a.servers.HTTP {
+		l, err := a.getHTTPListener(s)
 		if err != nil {
 			return err
 		}
 		a.listeners = append(a.listeners, l)
 	}
-	a.packetnet.SetFdStart(len(a.listeners) + 3)
+	a.packetnet.SetFdStart(len(a.h2cListeners) + len(a.listeners) + 3)
 	for _, s := range a.servers.UDP {
 		l, err := a.packetnet.ListenPacket(s.Network, s.Addr)
 		if err != nil {
@@ -119,64 +261,21 @@ func (a *app) listen() error {
 	return nil
 }
 
-func (a *app) serveHttp(wg *sync.WaitGroup) {
-	for i, s := range a.servers.HTTP {
-		a.sds = append(a.sds, a.http.Serve(s, a.listeners[i]))
-	}
-
-	for _, s := range a.sds {
-		go func(s httpdown.Server) {
-			defer wg.Done()
-			if err := s.Wait(); err != nil {
-				a.errors <- err
-			}
-		}(s)
-	}
-}
-
-func (a *app) serveUdp(wg *sync.WaitGroup) {
-	for i, s := range a.servers.UDP {
-		if s.Threads == 0 {
-			s.Threads++
-		}
-		for t := 0; t < s.Threads; t++ {
-			go func(s_index int, t_index int, server *UdpServer) {
-				defer wg.Done()
-				wg.Add(1) // Wait for the thread
-				server.Handler(a.connections[s_index], server.Data)
-			}(i, t, s)
-		}
-	}
-}
-
+// wait() initiates servers to start serving requests, then awaits
+// their termination
 func (a *app) wait() {
 	var wg sync.WaitGroup
 	go a.signalHandler(&wg)
-	wg.Add(2*len(a.listeners) + len(a.connections)) // Wait (http & udp) & Stop (http)
+	a.serveH2C(&wg)
 	a.serveHttp(&wg)
 	a.serveUdp(&wg)
 	wg.Wait()
 }
 
-func (a *app) term(wg *sync.WaitGroup) {
-	for _, s := range a.sds {
-		go func(s httpdown.Server) {
-			defer wg.Done()
-			if err := s.Stop(); err != nil {
-				a.errors <- err
-			}
-		}(s)
-	}
-	for _, c := range a.connections {
-		go func(c *net.UDPConn) {
-			defer wg.Done()
-			if err := c.Close(); err != nil {
-				a.errors <- err
-			}
-		}(c)
-	}
-}
-
+// signalHandler manages event-handling corresponding to all external
+// signals that the application must react to. This is therefore, also
+// the place that initiates the graceful killing and spawning of a new
+// process for the application under consideration
 func (a *app) signalHandler(wg *sync.WaitGroup) {
 	ch := make(chan os.Signal, 10)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2, syscall.SIGCHLD)
@@ -190,12 +289,25 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 		case syscall.SIGINT, syscall.SIGTERM:
 			// this ensures a subsequent INT/TERM will trigger standard go behaviour of terminating.
 			signal.Stop(ch)
-			// this ensures process terminates after a timeout
+			// this ensures process terminates after a timeout eventually to avoid leaking
+			// processes when the termination does something awry
 			go func() {
 				time.Sleep(defaultTimeout)
 				a.errors <- ErrTimeout
 			}()
-			a.term(wg)
+			var (
+				forceClose bool
+			)
+			if a.allowNonGracefulTerminations {
+				// only check status of the child when non-graceful terminations are
+				// allowed on the process managing the servers
+				if a.childExists() {
+					forceClose = false // the child asking the parent to die
+				} else {
+					forceClose = true // usual SIGTERMs
+				}
+			}
+			a.terminateProcess(wg, forceClose)
 			return
 		case syscall.SIGUSR2:
 			if !a.childExists() {
@@ -204,7 +316,7 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 				}
 				// we only return here if there's an error, otherwise the new process
 				// will send us a TERM when it's ready to trigger the actual shutdown.
-				if _, err := a.StartProcess(); err != nil {
+				if _, err := a.startProcess(); err != nil {
 					a.errors <- err
 				}
 			}
@@ -212,7 +324,7 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 	}
 }
 
-func (a *app) StartProcess() (int, error) {
+func (a *app) startProcess() (int, error) {
 	listeners, err := a.net.GetActiveListeners()
 	if err != nil {
 		return 0, err
@@ -279,99 +391,100 @@ func (a *app) StartProcess() (int, error) {
 	return process.Pid, nil
 }
 
-func Serve(servers MultiServer, options ...option) error {
-	a := newApp(servers)
-	for _, opt := range options {
-		opt(a)
-	}
-	// Acquire Listeners
-	if err := a.listen(); err != nil {
-		return err
-	}
-
-	// Some useful logging.
-	if logger != nil {
-		if didInherit {
-			if ppid == 1 {
-				logger.Printf("Listening on init activated %s", a.pprintAddr())
-			} else {
-				const msg = "Graceful handoff of %s with new pid %d and old pid %d"
-				logger.Printf(msg, a.pprintAddr(), os.Getpid(), ppid)
+func (a *app) terminateProcess(wg *sync.WaitGroup, forceClose bool) {
+	for _, s := range a.servers.H2C {
+		wg.Add(1)
+		go func(s *graceh2c.H2CServer) {
+			defer wg.Done()
+			if err := s.Stop(forceClose); err != nil {
+				a.errors <- err
 			}
-		} else {
-			const msg = "Serving %s with pid %d"
-			logger.Printf(msg, a.pprintAddr(), os.Getpid())
-		}
+		}(s)
 	}
-
-	// callback before killing parent process
-	if err := a.preKillProcess(); err != nil {
-		a.errors <- err
+	for _, s := range a.sds {
+		wg.Add(1)
+		go func(s httpdown.Server) {
+			defer wg.Done()
+			if err := s.Stop(); err != nil {
+				a.errors <- err
+			}
+		}(s)
 	}
-	// Close the parent if we inherited and it wasn't init that started us.
-	if didInherit && ppid != 1 {
-		if err := syscall.Kill(ppid, syscall.SIGTERM); err != nil {
-			return fmt.Errorf("failed to close parent: %s", err)
-		}
-	}
-
-	waitdone := make(chan struct{})
-	go func() {
-		defer close(waitdone)
-		a.wait()
-	}()
-
-	select {
-	case err := <-a.errors:
-		if err == nil {
-			panic("unexpected nil error")
-		}
-		return err
-	case <-waitdone:
-		if logger != nil {
-			logger.Printf("Exiting pid %d.", os.Getpid())
-		}
-		return nil
+	for _, c := range a.connections {
+		wg.Add(1)
+		go func(c *net.UDPConn) {
+			defer wg.Done()
+			if err := c.Close(); err != nil {
+				a.errors <- err
+			}
+		}(c)
 	}
 }
 
-// PreStartProcess configures a callback to trigger during graceful restart
-// directly before starting the successor process. This allows the current
-// process to release holds on resources that the new process will need.
-func PreStartProcess(hook func() error) option {
-	return func(a *app) {
-		a.preStartProcess = hook
+func (a *app) serveH2C(wg *sync.WaitGroup) {
+	for index, s := range a.servers.H2C {
+		wg.Add(1)
+		go func(s *graceh2c.H2CServer) {
+			defer wg.Done()
+			srv := s.Server()
+			if err := srv.Serve(a.h2cListeners[index]); err != nil && err != http.ErrServerClosed {
+				if logger != nil {
+					logger.Printf("error serving on %s: %s", srv.Addr, err)
+				}
+				a.errors <- err
+			}
+		}(s)
 	}
 }
 
-// PreKillProcess configures a callback to trigger after graceful restart
-// directly before killing the parent process. This allows the current
-// process to acquire holds on resources that the new process will need.
-func PreKillProcess(hook func() error) option {
-	return func(a *app) {
-		a.preKillProcess = hook
+func (a *app) serveHttp(wg *sync.WaitGroup) {
+	for i, s := range a.servers.HTTP {
+		a.sds = append(a.sds, a.http.Serve(s, a.listeners[i]))
+	}
+
+	for _, s := range a.sds {
+		wg.Add(1)
+		go func(s httpdown.Server) {
+			defer wg.Done()
+			if err := s.Wait(); err != nil {
+				a.errors <- err
+			}
+		}(s)
 	}
 }
 
-// PostKilledProcess configures a callback to trigger when forked child dies
-// abruptly after graceful restart. This allows the parent process to handle
-// cleanup, logging & resources that the child process might have used.
-func PostKillledChild(hook func() error) option {
-	return func(a *app) {
-		a.postKilledChild = hook
+func (a *app) serveUdp(wg *sync.WaitGroup) {
+	for i, s := range a.servers.UDP {
+		if s.Threads == 0 {
+			s.Threads++
+		}
+		for t := 0; t < s.Threads; t++ {
+			go func(s_index int, t_index int, server *UdpServer) {
+				defer wg.Done()
+				wg.Add(1) // Wait for the thread
+				server.Handler(a.connections[s_index], server.Data)
+			}(i, t, s)
+		}
 	}
 }
 
 func (a *app) pprintAddr() []byte {
 	var out bytes.Buffer
-	fmt.Fprint(&out, "[HTTP]")
+	fmt.Fprint(&out, " [H2C] ")
+	for i, l := range a.h2cListeners {
+		if i != 0 {
+			fmt.Fprint(&out, ", ")
+		}
+		fmt.Fprint(&out, l.Addr())
+	}
+	fmt.Fprint(&out, " [HTTP] ")
 	for i, l := range a.listeners {
 		if i != 0 {
 			fmt.Fprint(&out, ", ")
 		}
 		fmt.Fprint(&out, l.Addr())
 	}
-	fmt.Fprint(&out, " [UDP]")
+	fmt.Fprint(&out, " [UDP] ")
 	for i, l := range a.connections {
 		if i != 0 {
 			fmt.Fprint(&out, ", ")
