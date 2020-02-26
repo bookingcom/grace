@@ -25,8 +25,8 @@ import (
 
 const (
 	// Used to indicate a graceful restart in the new process.
-	envCountListners    = "LISTEN_FDS"
-	envCountConnections = "CONN_FDS"
+	envCountTCPListners  = "LISTEN_FDS"
+	envCountUDPListeners = "CONN_FDS"
 
 	// default timeout is 60 seconds
 	defaultTimeout = 60 * time.Second
@@ -40,7 +40,7 @@ var ErrTimeout = errors.New("shutdown wait timed out")
 
 var (
 	logger     *log.Logger
-	didInherit = (os.Getenv(envCountListners) != "") || (os.Getenv(envCountConnections) != "")
+	didInherit = (os.Getenv(envCountTCPListners) != "") || (os.Getenv(envCountUDPListeners) != "")
 	ppid       = os.Getppid()
 )
 
@@ -68,14 +68,14 @@ type app struct {
 	h2cListeners []net.Listener
 
 	// HTTP servers and their internal dependencies
-	http      *httpdown.HTTP
-	net       *gracenet.Net
-	listeners []net.Listener
-	sds       []httpdown.Server
+	http         *httpdown.HTTP
+	net          *gracenet.Net
+	tcpListeners []net.Listener
+	sds          []httpdown.Server
 
 	// UDP servers and their internal dependencies
-	packetnet   *gracenetpacket.Net
-	connections []*net.UDPConn
+	packetnet    *gracenetpacket.Net
+	udpListeners []*net.UDPConn
 
 	// application-specific internals that help manage its lifecycle
 	childPID int
@@ -102,12 +102,12 @@ func newApp(servers MultiServer) *app {
 
 		http:         &httpdown.HTTP{},
 		h2cListeners: make([]net.Listener, 0, lenH2C),
-		listeners:    make([]net.Listener, 0, lenHttp),
+		tcpListeners: make([]net.Listener, 0, lenHttp),
 		sds:          make([]httpdown.Server, 0, lenHttp),
 
-		net:         &gracenet.Net{},
-		packetnet:   &gracenetpacket.Net{},
-		connections: make([]*net.UDPConn, 0, lenUdp),
+		net:          &gracenet.Net{},
+		packetnet:    &gracenetpacket.Net{},
+		udpListeners: make([]*net.UDPConn, 0, lenUdp),
 
 		childPID: 0,
 		errors:   make(chan error, 1+(lenH2C+lenHttp+lenUdp)*2),
@@ -248,15 +248,15 @@ func (a *app) acquireListeners() error {
 		if err != nil {
 			return err
 		}
-		a.listeners = append(a.listeners, l)
+		a.tcpListeners = append(a.tcpListeners, l)
 	}
-	a.packetnet.SetFdStart(len(a.h2cListeners) + len(a.listeners) + 3)
+	a.packetnet.SetFdStart(len(a.h2cListeners) + len(a.tcpListeners) + 3)
 	for _, s := range a.servers.UDP {
 		l, err := a.packetnet.ListenPacket(s.Network, s.Addr)
 		if err != nil {
 			return err
 		}
-		a.connections = append(a.connections, l.(*net.UDPConn))
+		a.udpListeners = append(a.udpListeners, l.(*net.UDPConn))
 	}
 	return nil
 }
@@ -325,22 +325,22 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 }
 
 func (a *app) startProcess() (int, error) {
-	listeners, err := a.net.GetActiveListeners()
+	tcpListeners, err := a.net.GetActiveListeners()
 	if err != nil {
 		return 0, err
 	}
 
-	connections, err := a.packetnet.GetActiveListeners()
+	udpListeners, err := a.packetnet.GetActiveListeners()
 	if err != nil {
 		return 0, err
 	}
 
 	// Extract the fds from the listeners.
-	files := make([]*os.File, len(listeners)+len(connections))
+	files := make([]*os.File, len(tcpListeners)+len(udpListeners))
 	var fdl, fdc []string
 
 	i := 0
-	for _, l := range listeners {
+	for _, l := range tcpListeners {
 		files[i], err = l.(filer).File()
 		if err != nil {
 			return 0, err
@@ -351,7 +351,7 @@ func (a *app) startProcess() (int, error) {
 		i++
 	}
 
-	for _, l := range connections {
+	for _, l := range udpListeners {
 		files[i], err = l.(filer).File()
 		if err != nil {
 			return 0, err
@@ -371,12 +371,12 @@ func (a *app) startProcess() (int, error) {
 
 	var env []string
 	for _, v := range os.Environ() {
-		if !strings.HasPrefix(v, envCountListners) && !strings.HasPrefix(v, envCountConnections) {
+		if !strings.HasPrefix(v, envCountTCPListners) && !strings.HasPrefix(v, envCountUDPListeners) {
 			env = append(env, v)
 		}
 	}
-	env = append(env, fmt.Sprintf("%s=%d", envCountListners, len(fdl)))
-	env = append(env, fmt.Sprintf("%s=%d", envCountConnections, len(fdc)))
+	env = append(env, fmt.Sprintf("%s=%d", envCountTCPListners, len(fdl)))
+	env = append(env, fmt.Sprintf("%s=%d", envCountUDPListeners, len(fdc)))
 
 	allFiles := append([]*os.File{os.Stdin, os.Stdout, os.Stderr}, files...)
 	process, err := os.StartProcess(argv0, os.Args, &os.ProcAttr{
@@ -410,7 +410,7 @@ func (a *app) terminateProcess(wg *sync.WaitGroup, forceClose bool) {
 			}
 		}(s)
 	}
-	for _, c := range a.connections {
+	for _, c := range a.udpListeners {
 		wg.Add(1)
 		go func(c *net.UDPConn) {
 			defer wg.Done()
@@ -439,7 +439,7 @@ func (a *app) serveH2C(wg *sync.WaitGroup) {
 
 func (a *app) serveHttp(wg *sync.WaitGroup) {
 	for i, s := range a.servers.HTTP {
-		a.sds = append(a.sds, a.http.Serve(s, a.listeners[i]))
+		a.sds = append(a.sds, a.http.Serve(s, a.tcpListeners[i]))
 	}
 
 	for _, s := range a.sds {
@@ -462,7 +462,7 @@ func (a *app) serveUdp(wg *sync.WaitGroup) {
 			go func(s_index int, t_index int, server *UdpServer) {
 				defer wg.Done()
 				wg.Add(1) // Wait for the thread
-				server.Handler(a.connections[s_index], server.Data)
+				server.Handler(a.udpListeners[s_index], server.Data)
 			}(i, t, s)
 		}
 	}
@@ -478,14 +478,14 @@ func (a *app) pprintAddr() []byte {
 		fmt.Fprint(&out, l.Addr())
 	}
 	fmt.Fprint(&out, " [HTTP] ")
-	for i, l := range a.listeners {
+	for i, l := range a.tcpListeners {
 		if i != 0 {
 			fmt.Fprint(&out, ", ")
 		}
 		fmt.Fprint(&out, l.Addr())
 	}
 	fmt.Fprint(&out, " [UDP] ")
-	for i, l := range a.connections {
+	for i, l := range a.udpListeners {
 		if i != 0 {
 			fmt.Fprint(&out, ", ")
 		}
