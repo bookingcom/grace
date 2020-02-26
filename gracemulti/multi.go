@@ -337,16 +337,12 @@ func (a *app) startProcess() (int, error) {
 
 	// Extract the fds from the listeners.
 	files := make([]*os.File, len(tcpListeners)+len(udpListeners))
-	var fdl, fdc []string
-
 	i := 0
 	for _, l := range tcpListeners {
 		files[i], err = l.(filer).File()
 		if err != nil {
 			return 0, err
 		}
-		fd, _ := syscall.Dup(int(files[i].Fd()))
-		fdl = append(fdl, fmt.Sprint(fd))
 		defer files[i].Close()
 		i++
 	}
@@ -356,8 +352,6 @@ func (a *app) startProcess() (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		fd, _ := syscall.Dup(int(files[i].Fd()))
-		fdc = append(fdc, fmt.Sprint(fd))
 		defer files[i].Close()
 		i++
 	}
@@ -375,8 +369,8 @@ func (a *app) startProcess() (int, error) {
 			env = append(env, v)
 		}
 	}
-	env = append(env, fmt.Sprintf("%s=%d", envCountTCPListners, len(fdl)))
-	env = append(env, fmt.Sprintf("%s=%d", envCountUDPListeners, len(fdc)))
+	env = append(env, fmt.Sprintf("%s=%d", envCountTCPListners, len(tcpListeners)))
+	env = append(env, fmt.Sprintf("%s=%d", envCountUDPListeners, len(udpListeners)))
 
 	allFiles := append([]*os.File{os.Stdin, os.Stdout, os.Stderr}, files...)
 	process, err := os.StartProcess(argv0, os.Args, &os.ProcAttr{
