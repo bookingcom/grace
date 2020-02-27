@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -101,7 +103,12 @@ func httpsServer(addr string) *http.Server {
 	}
 }
 
+var fh1 *net.UDPConn
+
 func testbinMain() {
+	out, err := exec.Command("lsof", "-p", fmt.Sprintf("%d", os.Getpid())).Output()
+	fmt.Println(string(out), err)
+
 	var httpAddr, httpsAddr string
 	var testOption int
 	flag.StringVar(&httpAddr, "http", ":48560", "http address to bind to")
@@ -131,6 +138,9 @@ func testbinMain() {
 			log.Fatalf("Error writing startup json: %s", err)
 		}
 	}()
+
+	fh1, err = net.DialUDP("udp", nil, &net.UDPAddr{Port: 7777})
+	fmt.Println("GOT", fh1, err)
 
 	servers := []*http.Server{
 		&http.Server{Addr: httpAddr, Handler: newHandler()},

@@ -130,7 +130,8 @@ func (a *app) run() error {
 	if err := a.listen(); err != nil {
 		return err
 	}
-
+	inherited, used := a.net.InheritedStats()
+	fmt.Println("INHERIT ", inherited, used)
 	// Some useful logging.
 	if logger != nil {
 		if didInherit {

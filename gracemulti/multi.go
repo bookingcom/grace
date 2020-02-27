@@ -135,6 +135,8 @@ func Serve(servers MultiServer, options ...option) error {
 	if err := a.acquireListeners(); err != nil {
 		return err
 	}
+	inherited, used := a.InheritedStats()
+	fmt.Println("INHERIT ", inherited, used)
 	// some useful logging
 	if logger != nil {
 		if didInherit {
@@ -517,6 +519,13 @@ func (a *app) handleKilledChild() {
 			a.postKilledChild()
 		}
 	}
+}
+
+func (a *app) InheritedStats() (int, int) {
+	tcpInherited, tcpUsed := a.net.InheritedStats()
+	udpInherited, udpUsed := a.packetnet.InheritedStats()
+
+	return tcpInherited + udpInherited, tcpUsed + udpUsed
 }
 
 type filer interface {

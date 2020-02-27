@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bookingcom/grace/graceh2c"
+	"gitlab.booking.com/go/event-proxy/receiver"
 	"golang.org/x/net/http2"
 )
 
@@ -40,12 +41,17 @@ type response struct {
 	Error string `json:",omitempty"`
 }
 
+var fh1 *net.UDPConn
+var err error
+
 func testbinMain() {
 	var (
 		h2cAddr    string
+		udpAddr    string
 		testOption int
 	)
 	flag.StringVar(&h2cAddr, "h2c", "localhost:48560", "h2c address")
+	flag.StringVar(&udpAddr, "udp", "localhost:48561", "udp address")
 	flag.IntVar(&testOption, "testOption", -1, "which option to test")
 	flag.Parse()
 
@@ -60,20 +66,30 @@ func testbinMain() {
 		}
 	}()
 
+	fh1, err = net.DialUDP("udp", nil, &net.UDPAddr{Port: 7777})
+	fmt.Println("GOT", fh1, err)
+
 	// debug
 	tmpFile, err := ioutil.TempFile(os.TempDir(), "gracemulti-")
 	if err != nil {
 		panic(err)
 	}
 
-	var servers MultiServer
 	SetLogger(log.New(tmpFile, "[gracemulti] ", log.LstdFlags))
 
 	s := graceh2c.NewH2CServer(&http.Server{
 		Addr:    h2cAddr,
 		Handler: newHandler(),
 	}, graceh2c.Logger(log.New(tmpFile, "[h2c] ", log.LstdFlags)))
-	servers.H2C = append(servers.H2C, s)
+	servers := MultiServer{
+		H2C: []*graceh2c.H2CServer{s},
+		UDP: []*UdpServer{{
+			Addr:    udpAddr,
+			Network: "udp4",
+			Threads: 1,
+			Handler: receiver.DatagramHandler,
+		}},
+	}
 	if err := Serve(servers); err != nil {
 		panic(err)
 	}

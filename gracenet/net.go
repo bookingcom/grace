@@ -63,6 +63,8 @@ func (n *Net) inherit() error {
 			fdStart = 3
 		}
 
+		out, err := exec.Command("lsof", "-p", fmt.Sprintf("%d", os.Getpid())).Output()
+		fmt.Println(string(out), err)
 		for i := fdStart; i < fdStart+count; i++ {
 			file := os.NewFile(uintptr(i), "listener")
 			l, err := net.FileListener(file)
@@ -75,6 +77,7 @@ func (n *Net) inherit() error {
 				retErr = fmt.Errorf("error closing inherited socket fd %d: %s", i, err)
 				return
 			}
+			fmt.Println("Got", i, l.Addr())
 			n.inherited = append(n.inherited, l)
 		}
 	})
@@ -114,13 +117,14 @@ func (n *Net) ListenTCP(nett string, laddr *net.TCPAddr) (*net.TCPListener, erro
 
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-
+	fmt.Println("LENGTH", len(n.inherited))
 	// look for an inherited listener
 	for i, l := range n.inherited {
 		if l == nil { // we nil used inherited listeners
 			continue
 		}
 		if isSameAddr(l.Addr(), laddr) {
+			fmt.Println("INHERITED")
 			n.inherited[i] = nil
 			n.active = append(n.active, l)
 			return l.(*net.TCPListener), nil
@@ -128,6 +132,7 @@ func (n *Net) ListenTCP(nett string, laddr *net.TCPAddr) (*net.TCPListener, erro
 	}
 
 	// make a fresh listener
+	fmt.Println("NOPE")
 	l, err := net.ListenTCP(nett, laddr)
 	if err != nil {
 		return nil, err
@@ -249,6 +254,16 @@ func (n *Net) StartProcess() (int, error) {
 
 func (n *Net) GetActiveListeners() ([]net.Listener, error) {
 	return n.activeListeners()
+}
+
+func (n *Net) InheritedStats() (int, int) {
+	inheritedUsed := 0
+	for _, f := range n.inherited {
+		if f == nil {
+			inheritedUsed++
+		}
+	}
+	return len(n.inherited), inheritedUsed
 }
 
 type filer interface {

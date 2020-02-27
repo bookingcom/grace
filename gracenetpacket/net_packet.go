@@ -201,6 +201,16 @@ func (n *Net) StartProcess() (int, error) {
 	return process.Pid, nil
 }
 
+func (n *Net) InheritedStats() (int, int) {
+	inheritedUsed := 0
+	for _, f := range n.inherited {
+		if f == nil {
+			inheritedUsed++
+		}
+	}
+	return len(n.inherited), inheritedUsed
+}
+
 type filer interface {
 	File() (*os.File, error)
 }
