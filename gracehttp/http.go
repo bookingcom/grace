@@ -15,7 +15,7 @@ import (
 	"syscall"
 
 	"github.com/bookingcom/grace/gracenet"
-	"github.com/facebookgo/httpdown"
+	"github.com/facebookarchive/httpdown"
 )
 
 var (

@@ -20,7 +20,7 @@ import (
 	"github.com/bookingcom/grace/graceh2c"
 	"github.com/bookingcom/grace/gracenet"
 	"github.com/bookingcom/grace/gracenetpacket"
-	"github.com/facebookgo/httpdown"
+	"github.com/facebookarchive/httpdown"
 )
 
 const (
