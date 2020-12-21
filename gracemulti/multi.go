@@ -90,6 +90,9 @@ type app struct {
 
 	// allow non-graceful terminations
 	allowNonGracefulTerminations bool
+
+	// shutdown timeout
+	shutdownTimeout time.Duration
 }
 
 func newApp(servers MultiServer) *app {
@@ -117,6 +120,8 @@ func newApp(servers MultiServer) *app {
 		postKilledChild: func() error { return nil },
 
 		allowNonGracefulTerminations: false,
+
+		shutdownTimeout: defaultTimeout,
 	}
 }
 
@@ -131,6 +136,7 @@ func Serve(servers MultiServer, options ...option) error {
 	for _, opt := range options {
 		opt(a)
 	}
+
 	// acquire listeners to be able to do the graceful dance later
 	if err := a.acquireListeners(); err != nil {
 		return err
@@ -217,6 +223,15 @@ func PostKilledChild(hook func() error) option {
 	}
 }
 
+// ShutdownTimeout configures graceful shudown timeout. If listening processes
+// can't be gracefully closed within this timeout, shutdown will be allowd
+// to proceed anyway.
+func ShutdownTimeout(shutdownTimeout time.Duration) option {
+	return func(a *app) {
+		a.shutdownTimeout = shutdownTimeout
+	}
+}
+
 // ------------------- internal methods -----------------------
 func (a *app) getHTTPListener(server *http.Server) (net.Listener, error) {
 	var (
@@ -292,7 +307,7 @@ func (a *app) signalHandler(wg *sync.WaitGroup) {
 			// this ensures process terminates after a timeout eventually to avoid leaking
 			// processes when the termination does something awry
 			go func() {
-				time.Sleep(defaultTimeout)
+				time.Sleep(a.shutdownTimeout)
 				a.errors <- ErrTimeout
 			}()
 			var (
@@ -432,6 +447,9 @@ func (a *app) serveH2C(wg *sync.WaitGroup) {
 }
 
 func (a *app) serveHttp(wg *sync.WaitGroup) {
+	a.http.StopTimeout = a.serverShutdownTimeout()
+	a.http.KillTimeout = 10 * time.Millisecond
+
 	for i, s := range a.servers.HTTP {
 		a.sds = append(a.sds, a.http.Serve(s, a.tcpListeners[i]))
 	}
@@ -517,6 +535,14 @@ func (a *app) handleKilledChild() {
 			a.postKilledChild()
 		}
 	}
+}
+
+func (a *app) serverShutdownTimeout() time.Duration {
+	serverShutdownTimeout := a.shutdownTimeout - 300*time.Millisecond
+	if serverShutdownTimeout < 0 {
+		serverShutdownTimeout = 10 * time.Millisecond
+	}
+	return serverShutdownTimeout
 }
 
 type filer interface {
